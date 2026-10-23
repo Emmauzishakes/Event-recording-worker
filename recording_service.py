@@ -25,6 +25,7 @@ from config import (
 )
 
 from livekit_service import LiveKitReceiver
+from media_validation import validate_mp4
 from s3_service import upload_file
 
 
@@ -131,36 +132,17 @@ class RecordingManager:
         container: Optional[av.container.OutputContainer] = None
 
         try:
-            Path(RECORDINGS_DIR).mkdir(
-                parents=True,
-                exist_ok=True,
-            )
+            Path(RECORDINGS_DIR).mkdir(parents=True, exist_ok=True)
 
-            job.local_path = os.path.join(
-                RECORDINGS_DIR,
-                f"{job.job_id}.mp4",
-            )
-
-            token = await self._request_recording_token(
-                room=job.room,
-                job_id=job.job_id,
-            )
-
-            receiver = LiveKitReceiver(
-                livekit_url=LIVEKIT_URL,
-                token=token,
-            )
+            job.local_path = os.path.join(RECORDINGS_DIR, f"{job.job_id}.mp4")
+            partial_path = os.path.join(RECORDINGS_DIR, f"{job.job_id}.partial.mp4")
+            token = await self._request_recording_token(room=job.room, job_id=job.job_id)
+            receiver = LiveKitReceiver(livekit_url=LIVEKIT_URL, token=token)
 
             await receiver.connect()
+            logger.info("Waiting for broadcaster media...")
 
-            logger.info(
-                "Waiting for broadcaster media..."
-            )
-
-            first_video = await receiver.wait_for_video(
-                timeout=60
-            )
-
+            first_video = await receiver.wait_for_video(timeout=60)
             first_audio = None
 
             try:
@@ -172,16 +154,9 @@ class RecordingManager:
                     "No audio received yet; continuing"
                 )
 
-            container = av.open(
-                job.local_path,
-                mode="w",
-                format="mp4",
-            )
+            container = av.open(partial_path, mode="w", format="mp4")
 
-            video_stream = container.add_stream(
-                VIDEO_CODEC,
-                rate=VIDEO_FPS,
-            )
+            video_stream = container.add_stream(VIDEO_CODEC, rate=VIDEO_FPS)
 
             video_stream.width = VIDEO_WIDTH
             video_stream.height = VIDEO_HEIGHT
@@ -192,85 +167,48 @@ class RecordingManager:
                 "crf": str(VIDEO_CRF),
             }
 
-            audio_stream = None
-
-            if first_audio is not None:
-                audio_stream = container.add_stream(
-                    "aac",
-                    rate=48000,
-                )
-
-                audio_stream.layout = "stereo"
+            audio_stream = container.add_stream("aac", rate=48000)
+            audio_stream.layout = "stereo"
 
             job.status = "recording"
             job.started_at = time.time()
 
-            await self._callback_started(
-                job
-            )
+            await self._callback_started(job)
 
             video_task = asyncio.create_task(
-                self._write_video(
-                    job,
-                    receiver,
-                    container,
-                    video_stream,
-                    first_video,
-                )
+                self._write_video(job, receiver, container, video_stream, first_video)
+            )
+            audio_task = asyncio.create_task(
+                self._write_audio(job, receiver, container, audio_stream, first_audio)
             )
 
-            audio_task = None
+            await asyncio.gather(video_task, audio_task)
 
-            if audio_stream is not None:
-                audio_task = asyncio.create_task(
-                    self._write_audio(
-                        job,
-                        receiver,
-                        container,
-                        audio_stream,
-                        first_audio,
-                    )
-                )
+            for packet in video_stream.encode(None):
+                container.mux(packet)
+            for packet in audio_stream.encode(None):
+                container.mux(packet)
 
-            await asyncio.gather(
-                video_task,
-                *(
-                    [audio_task]
-                    if audio_task is not None
-                    else []
-                ),
-            )
+            container.close()
+            container = None
 
-            if container is not None:
-                container.close()
-                container = None
+            os.replace(partial_path, job.local_path)
+            validation = validate_mp4(job.local_path)
 
-            job.status = "complete"
+            job.status = "finalizing"
             job.completed_at = time.time()
 
-            s3_key = (
-                f"{job.s3_prefix.rstrip('/')}/"
-                f"{job.job_id}.mp4"
-            )
-
+            s3_key = f"{job.s3_prefix.rstrip('/')}/{job.job_id}.mp4"
             job.s3_key = s3_key
-
-            file_size = upload_file(
-                job.local_path,
-                s3_key,
-            )
-
-            duration = (
-                job.completed_at
-                - job.started_at
-                if job.started_at
-                else 0
-            )
+            file_size = upload_file(job.local_path, s3_key)
+            duration = job.completed_at - job.started_at if job.started_at else 0
 
             await self._callback_complete(
                 job=job,
                 file_size=file_size,
                 duration=duration,
+                has_video=validation["has_video"],
+                has_audio=validation["has_audio"],
             )
 
             logger.info(
@@ -355,23 +293,16 @@ class RecordingManager:
 
         while not job.stop_event.is_set():
             try:
-                self._encode_audio_frame(
-                    container,
-                    stream,
-                    frame,
-                )
+                if frame is None:
+                    frame = await receiver.wait_for_audio(timeout=2)
 
-                frame = await receiver.wait_for_audio(
-                    timeout=2
-                )
+                self._encode_audio_frame(container, stream, frame)
+                frame = await receiver.wait_for_audio(timeout=2)
 
             except asyncio.TimeoutError:
                 continue
 
-        logger.info(
-            "Audio recording loop stopped: %s",
-            job.job_id,
-        )
+        logger.info("Audio recording loop stopped: %s", job.job_id)
 
     async def _encode_video_frame(
         self,
@@ -546,12 +477,10 @@ class RecordingManager:
         job: RecordingJob,
         file_size: int,
         duration: float,
+        has_video: bool,
+        has_audio: bool,
     ):
-        url = (
-            f"{BACKEND_INTERNAL_URL}"
-            f"/api/internal/recordings/"
-            f"{job.job_id}/complete"
-        )
+        url = f"{BACKEND_INTERNAL_URL}/api/internal/recordings/{job.job_id}/complete"
 
         await self._callback(
             url,
@@ -561,6 +490,8 @@ class RecordingManager:
                 "s3_key": job.s3_key,
                 "file_size": file_size,
                 "duration": round(duration, 3),
+                "has_video": has_video,
+                "has_audio": has_audio,
             },
         )
 
